@@ -1,392 +1,212 @@
-#include <WiFi.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#include <DHT.h>
-#include <LiquidCrystal_I2C.h>
-#include <Keypad.h>
-#include <ESP32Servo.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <freertos/semphr.h>
-#include <freertos/queue.h>
-#include <ArduinoJson.h>
-
-// WiFi Credentials
-#define WIFI_SSID "Wokwi-GUEST"
-#define WIFI_PASS ""
-
-// Hardware Pins
-#define PIR_PIN          13
-#define DOOR_PIN         14
-#define LDR_PIN          34
-#define DHT_PIN          15
-#define LOCK_SERVO_PIN   33
-#define CURTAIN_SERVO_PIN 18
-#define BUZZER_PIN       12
-#define RELAY_PIN        27
-#define WARNING_LED_PIN  32
-
-// Constants
-#define LOG_INTERVAL     1000
-#define WEBSOCKET_PORT   80
-unsigned long lastLogTime = 0;
-
-// Semaphores
-SemaphoreHandle_t relayMutex;
-SemaphoreHandle_t servoMutex;
-
-// Queue
-QueueHandle_t keypadQueue;
-
-// Event Group
-EventGroupHandle_t systemEvents;
-#define WARNING_ACTIVE_BIT (1 << 0)
-
-// Objects
-AsyncWebServer server(WEBSOCKET_PORT);
-AsyncWebSocket ws("/ws");
-DHT dht(DHT_PIN, DHT22);
-LiquidCrystal_I2C lcd(0x27, 16, 2);
-Servo lockServo;
-Servo curtainServo;
-
-// Keypad Setup
-const byte ROWS = 4;
-const byte COLS = 4;
-char keys[ROWS][COLS] = {
-  {'1','2','3','A'},
-  {'4','5','6','B'},
-  {'7','8','9','C'},
-  {'*','0','#','D'}
-};
-byte rowPins[ROWS] = {23, 19, 18, 17};
-byte colPins[COLS] = {16, 4, 2, 5};
-Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
-String password = "1234";
-String input = "";
-
-// WebSocket Functions
-void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
-  if (type == WS_EVT_CONNECT) {
-    Serial.println("WebSocket client connected");
-  } else if (type == WS_EVT_DISCONNECT) {
-    Serial.println("WebSocket client disconnected");
-  } else if (type == WS_EVT_DATA) {
-    StaticJsonDocument<200> doc;
-    DeserializationError error = deserializeJson(doc, data, len);
-    if (error) {
-      Serial.println("JSON parse error");
-      return;
-    }
-
-    String type = doc["type"];
-    int value = doc["value"];
-
-    if (type == "lock") {
-      if (xSemaphoreTake(servoMutex, portMAX_DELAY) == pdTRUE) {
-        lockServo.write(value ? 90 : 0);
-        xSemaphoreGive(servoMutex);
-        sendLockStatus(value);
-      }
-    } else if (type == "light") {
-      if (xSemaphoreTake(relayMutex, portMAX_DELAY) == pdTRUE) {
-        digitalWrite(RELAY_PIN, value);
-        xSemaphoreGive(relayMutex);
-        sendLightStatus(value);
-      }
-    } else if (type == "curtain") {
-      if (xSemaphoreTake(servoMutex, portMAX_DELAY) == pdTRUE) {
-        curtainServo.write(value ? 180 : 0);
-        xSemaphoreGive(servoMutex);
-        sendCurtainStatus(value);
-      }
-    }
-  }
-}
-
-void sendLockStatus(int value) {
-  StaticJsonDocument<100> doc;
-  doc["type"] = "lock_status";
-  doc["value"] = value;
-  String json;
-  serializeJson(doc, json);
-  ws.textAll(json);
-}
-
-void sendLightStatus(int value) {
-  StaticJsonDocument<100> doc;
-  doc["type"] = "light_status";
-  doc["value"] = value;
-  String json;
-  serializeJson(doc, json);
-  ws.textAll(json);
-}
-
-void sendCurtainStatus(int value) {
-  StaticJsonDocument<100> doc;
-  doc["type"] = "curtain_status";
-  doc["value"] = value;
-  String json;
-  serializeJson(doc, json);
-  ws.textAll(json);
-}
-
-void sendEnvironment(float temp, float hum, int light) {
-  StaticJsonDocument<200> doc;
-  doc["type"] = "environment";
-  doc["temperature"] = temp;
-  doc["humidity"] = hum;
-  doc["light"] = light;
-  String json;
-  serializeJson(doc, json);
-  ws.textAll(json);
-}
-
-void sendAlert(String message) {
-  StaticJsonDocument<200> doc;
-  doc["type"] = "alert";
-  doc["message"] = message;
-  String json;
-  serializeJson(doc, json);
-  ws.textAll(json);
-}
-
-void connectWiFi() {
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi Connected");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-}
-
-void keypadScannerTask(void *pvParameters) {
-  while (1) {
-    char key = keypad.getKey();
-    if (key != NO_KEY) {
-      xQueueSend(keypadQueue, &key, portMAX_DELAY);
-    }
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-  }
-}
-
-void logSystemStatus() {
-  if (millis() - lastLogTime >= LOG_INTERVAL) {
-    lastLogTime = millis();
-    
-    float temp = dht.readTemperature();
-    float hum = dht.readHumidity();
-    int light = analogRead(LDR_PIN);
-
-    Serial.println("\n--- System Status ---");
-    Serial.print("Temperature: ");
-    Serial.println(temp);
-    Serial.print("Humidity: ");
-    Serial.println(hum);
-    Serial.print("Light level: ");
-    Serial.println(light);
-    Serial.println("---------------------");
-  }
-}
-
-void TaskAntiTheft(void *pvParameters) {
-  bool lastState = false;
-  while (1) {
-    bool currentState = digitalRead(PIR_PIN) || !digitalRead(DOOR_PIN);
-    
-    if (currentState != lastState) {
-      if (currentState) {
-        xEventGroupSetBits(systemEvents, WARNING_ACTIVE_BIT);
-        sendAlert("Phát hiện xâm nhập!");
-        Serial.println("Cảnh báo: Phát hiện đột nhập!");
-      } else {
-        xEventGroupClearBits(systemEvents, WARNING_ACTIVE_BIT);
-        sendAlert("Trạng thái an toàn");
-        Serial.println("Trạng thái an toàn");
-      }
-      lastState = currentState;
-    }
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-  }
-}
-
-void TaskWarningHandler(void *pvParameters) {
-  while (1) {
-    EventBits_t bits = xEventGroupWaitBits(systemEvents, WARNING_ACTIVE_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
-
-    if (bits & WARNING_ACTIVE_BIT) {
-      while (xEventGroupGetBits(systemEvents) & WARNING_ACTIVE_BIT) {
-        digitalWrite(BUZZER_PIN, HIGH);
-        digitalWrite(WARNING_LED_PIN, HIGH);
-        vTaskDelay(200 / portTICK_PERIOD_MS);
-        digitalWrite(BUZZER_PIN, LOW);
-        digitalWrite(WARNING_LED_PIN, LOW);
-        vTaskDelay(200 / portTICK_PERIOD_MS);
-      }
-      digitalWrite(BUZZER_PIN, LOW);
-      digitalWrite(WARNING_LED_PIN, LOW);
-    }
-  }
-}
-
-void TaskAutomation(void *pvParameters) {
-  int lastLight = -1;
-  while (1) {
-    int light = analogRead(LDR_PIN);
-    
-    if (abs(light - lastLight) > 50) {
-      if (xSemaphoreTake(relayMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        bool newState = light < 1500;
-        digitalWrite(RELAY_PIN, newState);
-        sendLightStatus(newState);
-        lastLight = light;
-        xSemaphoreGive(relayMutex);
-      }
-    }
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-  }
-}
-
-void TaskMonitoring(void *pvParameters) {
-  float lastTemp = 0, lastHum = 0;
-  while (1) {
-    float temp = dht.readTemperature();
-    float hum = dht.readHumidity();
-    int light = analogRead(LDR_PIN);
-
-    if (!isnan(temp) && !isnan(hum)) {
-      if ((abs(temp - lastTemp) >= 0.5) || (abs(hum - lastHum) >= 1.0)) {
-        sendEnvironment(temp, hum, light);
-        if (temp > 35 || hum > 80) {
-          char alertMsg[50];
-          snprintf(alertMsg, sizeof(alertMsg), "Nhiệt độ: %.1fC, Độ ẩm: %.1f%%", temp, hum);
-          sendAlert(alertMsg);
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Home Control</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Arial', sans-serif;
+            background-color: #f0f2f5;
         }
-        lastTemp = temp;
-        lastHum = hum;
-      }
-    }
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
-  }
-}
+        .control-card {
+            transition: transform 0.2s;
+        }
+        .control-card:hover {
+            transform: translateY(-5px);
+        }
+        .status-dot {
+            height: 10px;
+            width: 10px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        .connected {
+            background-color: #22c55e;
+        }
+        .disconnected {
+            background-color: #ef4444;
+        }
+    </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+    <div class="max-w-4xl w-full bg-white rounded-xl shadow-xl p-6">
+        <div class="flex justify-between items-center mb-6">
+            <h1 class="text-2xl font-bold text-gray-800">Smart Home Control</h1>
+            <div class="flex items-center">
+                <span id="connectionStatus" class="status-dot disconnected"></span>
+                <span class="ml-2 text-sm text-gray-600">Disconnected</span>
+            </div>
+        </div>
 
-void TaskKeypadLock(void *pvParameters) {
-  lcd.init();
-  lcd.backlight();
-  lcd.print("NHAP MAT KHAU:");
-  lcd.setCursor(0, 1);
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <!-- Door Lock Control -->
+            <div class="control-card bg-gray-50 p-4 rounded-lg shadow">
+                <h2 class="text-lg font-semibold text-gray-700">Door Lock</h2>
+                <button id="lockButton" class="mt-2 w-full bg-blue-500 text-white py-2 rounded hover:bg-blue-600" onclick="toggleLock()">Unlock</button>
+                <p class="mt-2 text-sm text-gray-600">Status: <span id="lockStatus">Locked</span></p>
+            </div>
 
-  while (1) {
-    char key;
-    if (xQueueReceive(keypadQueue, &key, portMAX_DELAY) == pdTRUE) {
-      switch (key) {
-        case '*':
-          input = "";
-          lcd.setCursor(0, 1);
-          lcd.print("                ");
-          lcd.setCursor(0, 1);
-          break;
+            <!-- Light Control -->
+            <div class="control-card bg-gray-50 p-4 rounded-lg shadow">
+                <h2 class="text-lg font-semibold text-gray-700">Light</h2>
+                <button id="lightButton" class="mt-2 w-full bg-blue-500 text-white py-2 rounded hover:bg-blue-600" onclick="toggleLight()">Turn On</button>
+                <p class="mt-2 text-sm text-gray-600">Status: <span id="lightStatus">Off</span></p>
+            </div>
 
-        case '#':
-          if (input == password) {
-            xSemaphoreTake(servoMutex, portMAX_DELAY);
-            lockServo.write(90);
-            xSemaphoreGive(servoMutex);
-            sendLockStatus(1);
+            <!-- Curtain Control -->
+            <div class="control-card bg-gray-50 p-4 rounded-lg shadow">
+                <h2 class="text-lg font-semibold text-gray-700">Curtain</h2>
+                <button id="curtainButton" class="mt-2 w-full bg-blue-500 text-white py-2 rounded hover:bg-blue-600" onclick="toggleCurtain()">Open</button>
+                <p class="mt-2 text-sm text-gray-600">Status: <span id="curtainStatus">Closed</span></p>
+            </div>
+        </div>
 
-            lcd.clear();
-            lcd.print("MO CUA THANH CONG");
-            sendAlert("Cửa đã mở");
+        <!-- Environment Monitoring -->
+        <div class="mt-6 bg-gray-50 p-4 rounded-lg shadow">
+            <h2 class="text-lg font-semibold text-gray-700">Environment Status</h2>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-2">
+                <div>
+                    <p class="text-sm text-gray-600">Temperature: <span id="temperature">N/A</span> °C</p>
+                </div>
+                <div>
+                    <p class="text-sm text-gray-600">Humidity: <span id="humidity">N/A</span> %</p>
+                </div>
+                <div>
+                    <p class="text-sm text-gray-600">Light Level: <span id="lightLevel">N/A</span></p>
+                </div>
+            </div>
+        </div>
 
-            vTaskDelay(3000 / portTICK_PERIOD_MS);
-            
-            xSemaphoreTake(servoMutex, portMAX_DELAY);
-            lockServo.write(0);
-            xSemaphoreGive(servoMutex);
-            sendLockStatus(0);
-            
-            lcd.clear();
-            lcd.print("CUA DA KHOA");
-          } else {
-            lcd.clear();
-            lcd.print("SAI MAT KHAU!");
-            vTaskDelay(1500 / portTICK_PERIOD_MS);
-            lcd.clear();
-            lcd.print("NHAP MAT KHAU:");
-          }
-          input = "";
-          lcd.setCursor(0, 1);
-          break;
+        <!-- Alerts -->
+        <div class="mt-6 bg-gray-50 p-4 rounded-lg shadow">
+            <h2 class="text-lg font-semibold text-gray-700">Alerts</h2>
+            <p id="alertMessage" class="mt-2 text-sm text-gray-600">No alerts</p>
+        </div>
+    </div>
 
-        default:
-          if (input.length() < 6) {
-            input += key;
-            lcd.setCursor(input.length() - 1, 1);
-            lcd.print("*");
-          }
-      }
-    }
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-  }
-}
+    <script>
+        let ws;
+        const wsUrl = 'wss://your-esp32-ip:443'; // Replace with your ESP32 WebSocket server URL
 
-void setup() {
-  Serial.begin(115200);
+        function connectWebSocket() {
+            ws = new WebSocket(wsUrl);
 
-  // Initialize RTOS components
-  systemEvents = xEventGroupCreate();
-  keypadQueue = xQueueCreate(10, sizeof(char));
-  relayMutex = xSemaphoreCreateMutex();
-  servoMutex = xSemaphoreCreateMutex();
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                document.getElementById('connectionStatus').classList.remove('disconnected');
+                document.getElementById('connectionStatus').classList.add('connected');
+                document.getElementById('connectionStatus').nextElementSibling.textContent = 'Connected';
+            };
 
-  // Setup hardware
-  pinMode(PIR_PIN, INPUT);
-  pinMode(DOOR_PIN, INPUT_PULLUP);
-  pinMode(LDR_PIN, INPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(RELAY_PIN, OUTPUT);
-  pinMode(WARNING_LED_PIN, OUTPUT);
-  
-  digitalWrite(BUZZER_PIN, LOW);
-  digitalWrite(RELAY_PIN, LOW);
-  digitalWrite(WARNING_LED_PIN, LOW);
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleMessage(data);
+            };
 
-  // Configure servos
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  
-  lockServo.setPeriodHertz(50);
-  lockServo.attach(LOCK_SERVO_PIN, 500, 2500);
-  lockServo.write(0);
-  
-  curtainServo.setPeriodHertz(50);
-  curtainServo.attach(CURTAIN_SERVO_PIN, 500, 2500);
-  curtainServo.write(0);
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                document.getElementById('connectionStatus').classList.remove('connected');
+                document.getElementById('connectionStatus').classList.add('disconnected');
+                document.getElementById('connectionStatus').nextElementSibling.textContent = 'Disconnected';
+                setTimeout(connectWebSocket, 5000); // Reconnect after 5 seconds
+            };
 
-  // Connect to WiFi
-  connectWiFi();
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+        }
 
-  // Initialize WebSocket
-  ws.onEvent(onWebSocketEvent);
-  server.addHandler(&ws);
-  server.begin();
+        function handleMessage(data) {
+            switch (data.type) {
+                case 'lock_status':
+                    updateLockStatus(data.value);
+                    break;
+                case 'light_status':
+                    updateLightStatus(data.value);
+                    break;
+                case 'curtain_status':
+                    updateCurtainStatus(data.value);
+                    break;
+                case 'environment':
+                    updateEnvironment(data.temperature, data.humidity, data.light);
+                    break;
+                case 'alert':
+                    showAlert(data.message);
+                    break;
+            }
+        }
 
-  // Initialize LCD and sensors
-  Wire.begin(21, 22);
-  keypad.setDebounceTime(20);
-  dht.begin();
+        function toggleLock() {
+            const isLocked = document.getElementById('lockStatus').textContent === 'Locked';
+            sendCommand({ type: 'lock', value: isLocked ? 1 : 0 });
+        }
 
-  // Create tasks
-  xTaskCreate(keypadScannerTask, "Keypad", 3072, NULL, 3, NULL);
-  xTaskCreate(TaskWarningHandler, "Warning", 3072, NULL, 4, NULL);
-  xTaskCreate(TaskAntiTheft, "AntiTheft", 4096, NULL, 3, NULL);
-  xTaskCreate(TaskAutomation, "AutoLight", 4096, NULL, 2, NULL);
-  xTaskCreate(TaskMonitoring, "Monitor", 6144, NULL, 2, NULL);
-  xTaskCreate(TaskKeypadLock, "Lock", 6144, NULL, 4, NULL);
-}
+        function toggleLight() {
+            const isOff = document.getElementById('lightStatus').textContent === 'Off';
+            sendCommand({ type: 'light', value: isOff ? 1 : 0 });
+        }
 
-void loop() {
-  ws.cleanupClients(); // Clean up disconnected WebSocket clients
-}
+        function toggleCurtain() {
+            const isClosed = document.getElementById('curtainStatus').textContent === 'Closed';
+            sendCommand({ type: 'curtain', value: isClosed ? 1 : 0 });
+        }
+
+        function sendCommand(command) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(command));
+            }
+        }
+
+        function updateLockStatus(value) {
+            const lockButton = document.getElementById('lockButton');
+            const lockStatus = document.getElementById('lockStatus');
+            if (value) {
+                lockButton.textContent = 'Lock';
+                lockStatus.textContent = 'Unlocked';
+            } else {
+                lockButton.textContent = 'Unlock';
+                lockStatus.textContent = 'Locked';
+            }
+        }
+
+        function updateLightStatus(value) {
+            const lightButton = document.getElementById('lightButton');
+            const lightStatus = document.getElementById('lightStatus');
+            if (value) {
+                lightButton.textContent = 'Turn Off';
+                lightStatus.textContent = 'On';
+            } else {
+                lightButton.textContent = 'Turn On';
+                lightStatus.textContent = 'Off';
+            }
+        }
+
+        function updateCurtainStatus(value) {
+            const curtainButton = document.getElementById('curtainButton');
+            const curtainStatus = document.getElementById('curtainStatus');
+            if (value) {
+                curtainButton.textContent = 'Close';
+                curtainStatus.textContent = 'Open';
+            } else {
+                curtainButton.textContent = 'Open';
+                curtainStatus.textContent = 'Closed';
+            }
+        }
+
+        function updateEnvironment(temp, hum, light) {
+            document.getElementById('temperature').textContent = temp.toFixed(1);
+            document.getElementById('humidity').textContent = hum.toFixed(1);
+            document.getElementById('lightLevel').textContent = light;
+        }
+
+        function showAlert(message) {
+            document.getElementById('alertMessage').textContent = message;
+        }
+
+        // Initialize WebSocket connection
+        connectWebSocket();
+    </script>
+</body>
+</html>
