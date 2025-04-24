@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Smart Home Control</title>
+    <title>Smart House Control</title>
     <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
     <style>
         body {
@@ -33,180 +33,168 @@
 <body class="min-h-screen flex items-center justify-center p-4">
     <div class="max-w-4xl w-full bg-white rounded-xl shadow-xl p-6">
         <div class="flex justify-between items-center mb-6">
-            <h1 class="text-2xl font-bold text-gray-800">Smart Home Control</h1>
+            <h1 class="text-2xl font-bold text-gray-800">Smart House Control</h1>
             <div class="flex items-center">
                 <span id="connectionStatus" class="status-dot disconnected"></span>
                 <span class="ml-2 text-sm text-gray-600">Disconnected</span>
             </div>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            <!-- Door Lock Control -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <!-- Servo 1 Control -->
             <div class="control-card bg-gray-50 p-4 rounded-lg shadow">
-                <h2 class="text-lg font-semibold text-gray-700">Door Lock</h2>
-                <button id="lockButton" class="mt-2 w-full bg-blue-500 text-white py-2 rounded hover:bg-blue-600" onclick="toggleLock()">Unlock</button>
-                <p class="mt-2 text-sm text-gray-600">Status: <span id="lockStatus">Locked</span></p>
+                <h2 class="text-lg font-semibold text-gray-700">Door Lock (Servo 1)</h2>
+                <button id="servo1Button" class="mt-2 w-full bg-blue-500 text-white py-2 rounded hover:bg-blue-600" onclick="toggleServo1()">Unlock</button>
+                <p class="mt-2 text-sm text-gray-600">Status: <span id="servo1Status">Locked</span></p>
             </div>
 
-            <!-- Light Control -->
+            <!-- Servo 2 Control -->
             <div class="control-card bg-gray-50 p-4 rounded-lg shadow">
-                <h2 class="text-lg font-semibold text-gray-700">Light</h2>
-                <button id="lightButton" class="mt-2 w-full bg-blue-500 text-white py-2 rounded hover:bg-blue-600" onclick="toggleLight()">Turn On</button>
-                <p class="mt-2 text-sm text-gray-600">Status: <span id="lightStatus">Off</span></p>
-            </div>
-
-            <!-- Curtain Control -->
-            <div class="control-card bg-gray-50 p-4 rounded-lg shadow">
-                <h2 class="text-lg font-semibold text-gray-700">Curtain</h2>
-                <button id="curtainButton" class="mt-2 w-full bg-blue-500 text-white py-2 rounded hover:bg-blue-600" onclick="toggleCurtain()">Open</button>
-                <p class="mt-2 text-sm text-gray-600">Status: <span id="curtainStatus">Closed</span></p>
+                <h2 class="text-lg font-semibold text-gray-700">Curtain (Servo 2)</h2>
+                <button id="servo2Button" class="mt-2 w-full bg-blue-500 text-white py-2 rounded hover:bg-blue-600" onclick="toggleServo2()">Open</button>
+                <p class="mt-2 text-sm text-gray-600">Status: <span id="servo2Status">Closed</span></p>
             </div>
         </div>
 
         <!-- Environment Monitoring -->
         <div class="mt-6 bg-gray-50 p-4 rounded-lg shadow">
             <h2 class="text-lg font-semibold text-gray-700">Environment Status</h2>
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-2">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-2">
                 <div>
                     <p class="text-sm text-gray-600">Temperature: <span id="temperature">N/A</span> °C</p>
                 </div>
                 <div>
                     <p class="text-sm text-gray-600">Humidity: <span id="humidity">N/A</span> %</p>
                 </div>
-                <div>
-                    <p class="text-sm text-gray-600">Light Level: <span id="lightLevel">N/A</span></p>
-                </div>
             </div>
-        </div>
-
-        <!-- Alerts -->
-        <div class="mt-6 bg-gray-50 p-4 rounded-lg shadow">
-            <h2 class="text-lg font-semibold text-gray-700">Alerts</h2>
-            <p id="alertMessage" class="mt-2 text-sm text-gray-600">No alerts</p>
         </div>
     </div>
 
+    <script src="https://unpkg.com/paho-mqtt@1.1.0/paho-mqtt.js"></script>
     <script>
-        let ws;
-        const wsUrl = 'wss://your-esp32-ip:443'; // Replace with your ESP32 WebSocket server URL
+        // MQTT Configuration
+        const mqttBroker = 'wss://broker.hivemq.com:8000/mqtt'; // Replace with your MQTT broker WSS URL
+        const clientId = 'web_client_' + Math.random().toString(16).slice(3);
+        const client = new Paho.MQTT.Client(mqttBroker, clientId);
 
-        function connectWebSocket() {
-            ws = new WebSocket(wsUrl);
+        // MQTT Topics
+        const tempTopic = 'smart_house/temperature';
+        const humTopic = 'smart_house/humidity';
+        const servo1Topic = 'smart_house/servo1';
+        const servo2Topic = 'smart_house/servo2';
 
-            ws.onopen = () => {
-                console.log('WebSocket connected');
-                document.getElementById('connectionStatus').classList.remove('disconnected');
-                document.getElementById('connectionStatus').classList.add('connected');
-                document.getElementById('connectionStatus').nextElementSibling.textContent = 'Connected';
-            };
+        // Connection Status
+        let isConnected = false;
 
-            ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                handleMessage(data);
-            };
+        // MQTT Callbacks
+        client.onConnectionLost = (responseObject) => {
+            console.log('MQTT Connection Lost:', responseObject.errorMessage);
+            updateConnectionStatus(false);
+        };
 
-            ws.onclose = () => {
-                console.log('WebSocket disconnected');
-                document.getElementById('connectionStatus').classList.remove('connected');
-                document.getElementById('connectionStatus').classList.add('disconnected');
-                document.getElementById('connectionStatus').nextElementSibling.textContent = 'Disconnected';
-                setTimeout(connectWebSocket, 5000); // Reconnect after 5 seconds
-            };
+        client.onMessageArrived = (message) => {
+            const topic = message.destinationName;
+            const payload = message.payloadString;
 
-            ws.onerror = (error) => {
-                console.error('WebSocket error:', error);
-            };
-        }
+            if (topic === tempTopic) {
+                document.getElementById('temperature').textContent = parseFloat(payload).toFixed(2);
+            } else if (topic === humTopic) {
+                document.getElementById('humidity').textContent = parseFloat(payload).toFixed(2);
+            }
+        };
 
-        function handleMessage(data) {
-            switch (data.type) {
-                case 'lock_status':
-                    updateLockStatus(data.value);
-                    break;
-                case 'light_status':
-                    updateLightStatus(data.value);
-                    break;
-                case 'curtain_status':
-                    updateCurtainStatus(data.value);
-                    break;
-                case 'environment':
-                    updateEnvironment(data.temperature, data.humidity, data.light);
-                    break;
-                case 'alert':
-                    showAlert(data.message);
-                    break;
+        // Connect to MQTT Broker
+        client.connect({
+            onSuccess: () => {
+                console.log('MQTT Connected');
+                updateConnectionStatus(true);
+                // Subscribe to topics
+                client.subscribe(tempTopic);
+                client.subscribe(humTopic);
+            },
+            onFailure: (error) => {
+                console.error('MQTT Connection Failed:', error.errorMessage);
+                updateConnectionStatus(false);
+                setTimeout(connectMQTT, 5000); // Retry after 5 seconds
+            },
+            useSSL: true // Required for WSS
+        });
+
+        function connectMQTT() {
+            if (!isConnected) {
+                client.connect({
+                    onSuccess: () => {
+                        console.log('MQTT Reconnected');
+                        updateConnectionStatus(true);
+                        client.subscribe(tempTopic);
+                        client.subscribe(humTopic);
+                    },
+                    onFailure: (error) => {
+                        console.error('MQTT Reconnection Failed:', error.errorMessage);
+                        updateConnectionStatus(false);
+                        setTimeout(connectMQTT, 5000);
+                    },
+                    useSSL: true
+                });
             }
         }
 
-        function toggleLock() {
-            const isLocked = document.getElementById('lockStatus').textContent === 'Locked';
-            sendCommand({ type: 'lock', value: isLocked ? 1 : 0 });
-        }
-
-        function toggleLight() {
-            const isOff = document.getElementById('lightStatus').textContent === 'Off';
-            sendCommand({ type: 'light', value: isOff ? 1 : 0 });
-        }
-
-        function toggleCurtain() {
-            const isClosed = document.getElementById('curtainStatus').textContent === 'Closed';
-            sendCommand({ type: 'curtain', value: isClosed ? 1 : 0 });
-        }
-
-        function sendCommand(command) {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify(command));
-            }
-        }
-
-        function updateLockStatus(value) {
-            const lockButton = document.getElementById('lockButton');
-            const lockStatus = document.getElementById('lockStatus');
-            if (value) {
-                lockButton.textContent = 'Lock';
-                lockStatus.textContent = 'Unlocked';
+        function updateConnectionStatus(connected) {
+            isConnected = connected;
+            const statusDot = document.getElementById('connectionStatus');
+            const statusText = statusDot.nextElementSibling;
+            if (connected) {
+                statusDot.classList.remove('disconnected');
+                statusDot.classList.add('connected');
+                statusText.textContent = 'Connected';
             } else {
-                lockButton.textContent = 'Unlock';
-                lockStatus.textContent = 'Locked';
+                statusDot.classList.remove('connected');
+                statusDot.classList.add('disconnected');
+                statusText.textContent = 'Disconnected';
             }
         }
 
-        function updateLightStatus(value) {
-            const lightButton = document.getElementById('lightButton');
-            const lightStatus = document.getElementById('lightStatus');
-            if (value) {
-                lightButton.textContent = 'Turn Off';
-                lightStatus.textContent = 'On';
+        function toggleServo1() {
+            const isLocked = document.getElementById('servo1Status').textContent === 'Locked';
+            const angle = isLocked ? 90 : 0;
+            const message = new Paho.MQTT.Message(angle.toString());
+            message.destinationName = servo1Topic;
+            client.send(message);
+            updateServo1Status(angle);
+        }
+
+        function toggleServo2() {
+            const isClosed = document.getElementById('servo2Status').textContent === 'Closed';
+            const angle = isClosed ? 90 : 0;
+            const message = new Paho.MQTT.Message(angle.toString());
+            message.destinationName = servo2Topic;
+            client.send(message);
+            updateServo2Status(angle);
+        }
+
+        function updateServo1Status(angle) {
+            const servo1Button = document.getElementById('servo1Button');
+            const servo1Status = document.getElementById('servo1Status');
+            if (angle === 90) {
+                servo1Button.textContent = 'Lock';
+                servo1Status.textContent = 'Unlocked';
             } else {
-                lightButton.textContent = 'Turn On';
-                lightStatus.textContent = 'Off';
+                servo1Button.textContent = 'Unlock';
+                servo1Status.textContent = 'Locked';
             }
         }
 
-        function updateCurtainStatus(value) {
-            const curtainButton = document.getElementById('curtainButton');
-            const curtainStatus = document.getElementById('curtainStatus');
-            if (value) {
-                curtainButton.textContent = 'Close';
-                curtainStatus.textContent = 'Open';
+        function updateServo2Status(angle) {
+            const servo2Button = document.getElementById('servo2Button');
+            const servo2Status = document.getElementById('servo2Status');
+            if (angle === 90) {
+                servo2Button.textContent = 'Close';
+                servo2Status.textContent = 'Open';
             } else {
-                curtainButton.textContent = 'Open';
-                curtainStatus.textContent = 'Closed';
+                servo2Button.textContent = 'Open';
+                servo2Status.textContent = 'Closed';
             }
         }
-
-        function updateEnvironment(temp, hum, light) {
-            document.getElementById('temperature').textContent = temp.toFixed(1);
-            document.getElementById('humidity').textContent = hum.toFixed(1);
-            document.getElementById('lightLevel').textContent = light;
-        }
-
-        function showAlert(message) {
-            document.getElementById('alertMessage').textContent = message;
-        }
-
-        // Initialize WebSocket connection
-        connectWebSocket();
     </script>
 </body>
 </html>
