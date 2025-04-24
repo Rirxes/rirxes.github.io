@@ -73,7 +73,7 @@
     <script src="https://unpkg.com/paho-mqtt@1.1.0/paho-mqtt.js"></script>
     <script>
         // MQTT Configuration
-        const mqttBroker = 'wss://broker.hivemq.com:8000/mqtt'; // Replace with your MQTT broker WSS URL
+        const mqttBroker = 'wss://e4eaa9b2672c415b88deffad01ec95f1.s1.eu.hivemq.cloud:8883/mqtt'; // Replace with your MQTT broker WSS URL
         const clientId = 'web_client_' + Math.random().toString(16).slice(3);
         const client = new Paho.MQTT.Client(mqttBroker, clientId);
 
